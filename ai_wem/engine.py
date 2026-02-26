@@ -1,10 +1,13 @@
 """WEM Engine — Worker/Expert/Master AI chat orchestration.
 
-Async-first with sync wrapper. Apps provide:
-- system_prompt (str)
-- tools (list of OpenAI function-calling defs)
-- executor (ToolExecutor subclass)
+Async-first with sync wrapper. Apps configure at init:
+- system_prompt (str) — domain context
+- tools (list) — OpenAI function-calling defs
+- executor (ToolExecutor) — runs tool calls
 - optionally: classify_prompt + intent_map for Worker fast path
+- optionally: worker_hook for custom Worker logic
+
+Then just call: await engine.send_message("user text")
 """
 
 import asyncio
@@ -28,15 +31,41 @@ class WEMEngine:
     - Worker (fast provider): classify common intents, handle with single tool call
     - Expert (main provider): full tool-calling loop
     - Master (evaluator): evaluate Expert response, redo if needed
+
+    Usage:
+        engine = WEMEngine(
+            config=WEMConfig(expert_api_key="..."),
+            tools=MY_TOOLS,
+            executor=MyExecutor(),
+            system_prompt="You are a helpful assistant...",
+        )
+        result = await engine.send_message("hello")
     """
 
-    def __init__(self, config: WEMConfig):
+    def __init__(
+        self,
+        config: WEMConfig,
+        tools: Optional[list] = None,
+        executor: Optional[ToolExecutor] = None,
+        system_prompt: str = "",
+        classify_prompt: str = "",
+        intent_map: Optional[Dict[str, Tuple[str, dict]]] = None,
+        worker_hook: Optional[Callable] = None,
+    ):
         self.config = config
         self.messages: List[ChatMessage] = []
         self._total_input = 0
         self._total_output = 0
         self._master_input = 0
         self._master_output = 0
+
+        # Domain config (set once, used every message)
+        self.tools: list = tools or []
+        self.executor: Optional[ToolExecutor] = executor
+        self.system_prompt: str = system_prompt
+        self.classify_prompt: str = classify_prompt
+        self.intent_map: Optional[Dict[str, Tuple[str, dict]]] = intent_map
+        self.worker_hook: Optional[Callable] = worker_hook
 
         # Expert provider (required)
         self.expert_provider: LLMProvider = HttpApiProvider(
@@ -76,34 +105,29 @@ class WEMEngine:
 
     # ── Main entry point ──────────────────────────────────
 
-    async def send_message(
-        self,
-        user_text: str,
-        system_prompt: str,
-        tools: list,
-        executor: ToolExecutor,
-        classify_prompt: str = "",
-        intent_map: Optional[Dict[str, Tuple[str, dict]]] = None,
-        worker_hook: Optional[Callable] = None,
-    ) -> dict:
+    async def send_message(self, user_text: str, **overrides) -> dict:
         """Send user message through Worker/Expert/Master pipeline.
 
-        Args:
-            user_text: The user's message.
-            system_prompt: Domain-specific system prompt.
-            tools: OpenAI function-calling tool definitions.
-            executor: ToolExecutor implementation for this app.
-            classify_prompt: Template with {user_text} for Worker classification.
-                If empty, Worker tier is skipped.
-            intent_map: Maps intent string -> (tool_name, default_params).
-                Used by Worker to execute single tool call.
-            worker_hook: Optional async callable(user_text, executor) -> str|None.
-                Custom Worker implementation (e.g., ScriptIndex classification).
-                If it returns a string, that's the response. None falls through to Expert.
+        Uses tools/executor/system_prompt from __init__ by default.
+        Pass keyword args to override per-call (e.g., dynamic tools based on user role).
+
+        Overridable kwargs:
+            system_prompt, tools, executor, classify_prompt, intent_map, worker_hook
 
         Returns:
             {"reply": str, "tokens": int, "cost": float, "tier": "worker"|"expert"|"master"}
         """
+        # Resolve per-call values (override or instance default)
+        system_prompt = overrides.get("system_prompt", self.system_prompt)
+        tools = overrides.get("tools", self.tools)
+        executor = overrides.get("executor", self.executor)
+        classify_prompt = overrides.get("classify_prompt", self.classify_prompt)
+        intent_map = overrides.get("intent_map", self.intent_map)
+        worker_hook = overrides.get("worker_hook", self.worker_hook)
+
+        if not executor:
+            raise ValueError("No executor configured. Set executor at init or pass as override.")
+
         t0 = time.time()
         self._total_input = 0
         self._total_output = 0
@@ -172,7 +196,7 @@ class WEMEngine:
 
         return {"reply": response, "tokens": tokens, "cost": cost, "tier": tier}
 
-    def send_message_sync(self, **kwargs) -> dict:
+    def send_message_sync(self, user_text: str, **overrides) -> dict:
         """Synchronous wrapper for send_message. For use in sync apps (e.g., Flet UI)."""
         try:
             loop = asyncio.get_running_loop()
@@ -180,13 +204,12 @@ class WEMEngine:
             loop = None
 
         if loop and loop.is_running():
-            # Already in an async context — run in a new thread
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(asyncio.run, self.send_message(**kwargs))
+                future = pool.submit(asyncio.run, self.send_message(user_text, **overrides))
                 return future.result()
         else:
-            return asyncio.run(self.send_message(**kwargs))
+            return asyncio.run(self.send_message(user_text, **overrides))
 
     # ── Worker: classify intent → single tool call ────────
 
@@ -201,7 +224,7 @@ class WEMEngine:
         prompt = classify_prompt.format(user_text=user_text)
 
         try:
-            self._notify("Classifying...")
+            self._notify("Clasificando...")
             result = await asyncio.to_thread(
                 self._fast_provider.chat,
                 [{"role": "user", "content": prompt}],
@@ -226,19 +249,19 @@ class WEMEngine:
             params = {**default_params, **data.get("params", {})}
 
             # Execute the tool directly
-            self._notify(f"Executing: {tool_name}")
+            self._notify(f"Ejecutando: {tool_name}")
             tc = ToolCall(id=f"w_{uuid.uuid4().hex[:6]}", name=tool_name, arguments=params)
             tool_result = await executor.execute(tc)
             if tool_result.is_error:
                 return None  # Fall back to Expert
 
             # Format result with fast provider
-            self._notify("Formatting...")
+            self._notify("Formateando...")
             format_prompt = (
-                f"Question: {user_text}\n\n"
-                f"Data:\n{tool_result.content}\n\n"
-                "Respond to the user clearly and concisely. "
-                "Present the data in a readable format. Use markdown."
+                f"Pregunta: {user_text}\n\n"
+                f"Datos:\n{tool_result.content}\n\n"
+                "Responde al usuario de forma clara y concisa. "
+                "Presenta los datos de forma legible. Usa markdown."
             )
             format_result = await asyncio.to_thread(
                 self._fast_provider.chat,
@@ -270,7 +293,7 @@ class WEMEngine:
         max_chars = self.config.max_result_chars
 
         for iteration in range(max_iterations):
-            self._notify("Thinking...")
+            self._notify("Pensando...")
             log.info("Iteration %d — calling LLM...", iteration)
 
             # Call LLM (sync provider, run in thread)
@@ -284,7 +307,7 @@ class WEMEngine:
             tool_calls = result.get("tool_calls", [])
 
             if not tool_calls:
-                return content or "Could not generate a response."
+                return content or "No pude generar una respuesta."
 
             # Append assistant message with tool calls
             assistant_msg = {"role": "assistant", "content": content}
@@ -311,7 +334,7 @@ class WEMEngine:
                     arguments=tc_data["arguments"],
                 )
                 log.info("Tool: %s(%s)", tc.name, tc.arguments)
-                self._notify(f"Executing: {tc.name}")
+                self._notify(f"Ejecutando: {tc.name}")
 
                 tool_result = await executor.execute(tc)
                 api_messages.append({
@@ -323,7 +346,7 @@ class WEMEngine:
             if iteration > 0:
                 await asyncio.sleep(1)
 
-        return "Max iterations reached."
+        return "Se alcanzo el limite de iteraciones."
 
     # ── Master: evaluate Expert response ──────────────────
 
@@ -339,18 +362,18 @@ class WEMEngine:
                 )
 
         eval_prompt = (
-            "Evaluate if the Expert's response is correct and complete.\n\n"
-            f"User question: {user_text}\n\n"
-            f"Expert response:\n{expert_response[:2000]}\n\n"
+            "Evalua si la respuesta del Expert es correcta y completa.\n\n"
+            f"Pregunta del usuario: {user_text}\n\n"
+            f"Respuesta del Expert:\n{expert_response[:2000]}\n\n"
         )
         if tool_summary:
-            eval_prompt += f"Tools used ({len(tool_summary)}):\n"
+            eval_prompt += f"Herramientas usadas ({len(tool_summary)}):\n"
             eval_prompt += "\n".join(tool_summary[:5])
             eval_prompt += "\n\n"
 
         eval_prompt += (
-            'Respond ONLY with JSON: {"verdict": "ok"} or {"verdict": "redo", "reason": "..."}\n'
-            "Use 'redo' ONLY if the response has factual errors or doesn't answer the question."
+            'Responde SOLO con JSON: {"verdict": "ok"} o {"verdict": "redo", "reason": "..."}\n'
+            "Usa 'redo' SOLO si la respuesta tiene errores factuales o no responde la pregunta."
         )
 
         try:

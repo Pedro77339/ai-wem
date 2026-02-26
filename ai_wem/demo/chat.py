@@ -2,7 +2,7 @@
 
 Usage:
     python -m ai_wem.demo                          # uses config from env vars
-    python -m ai_wem.demo --provider gemini         # Gemini Flash
+    python -m ai_wem.demo --provider gemini         # Gemini
     python -m ai_wem.demo --provider ollama --model qwen3:8b
     python -m ai_wem.demo --provider claude
 
@@ -77,7 +77,14 @@ def build_config(provider_name: str, model: str = "") -> WEMConfig:
 def create_engine(provider_name: str, model: str = "") -> tuple:
     """Create engine for the given provider. Returns (engine, provider_name, model)."""
     config = build_config(provider_name, model)
-    engine = WEMEngine(config)
+    engine = WEMEngine(
+        config,
+        tools=MOCK_TOOLS,
+        executor=MockToolExecutor(),
+        system_prompt=SYSTEM_PROMPT,
+        classify_prompt=CLASSIFY_PROMPT,
+        intent_map=INTENT_MAP,
+    )
 
     # For Ollama, swap the expert provider
     if provider_name == "ollama":
@@ -101,14 +108,13 @@ async def main():
     args = parser.parse_args()
 
     engine, prov_name, model_name = create_engine(args.provider, args.model)
-    executor = MockToolExecutor()
     last_tier = ""
 
     print(f"\n=== WEM Demo Chat ===")
     print(f"Provider: {prov_name} | Model: {model_name}")
     print(f"Worker: {'ON' if engine._fast_provider else 'OFF'}")
     print(f"Master: {'ON' if engine._master_provider else 'OFF'}")
-    print(f"Tools: {', '.join(t['function']['name'] for t in MOCK_TOOLS)}")
+    print(f"Tools: {', '.join(t['function']['name'] for t in engine.tools)}")
     print(f"\nCommands: /clear /provider /switch <p> /model <m> /tier /quit\n")
 
     def on_status(status):
@@ -158,16 +164,9 @@ async def main():
                 print("  [Commands: /clear /provider /switch <p> /model <m> /tier /quit]")
             continue
 
-        # Send message through WEM
+        # Send message through WEM — just the text
         try:
-            result = await engine.send_message(
-                user_text=user_input,
-                system_prompt=SYSTEM_PROMPT,
-                tools=MOCK_TOOLS,
-                executor=executor,
-                classify_prompt=CLASSIFY_PROMPT,
-                intent_map=INTENT_MAP,
-            )
+            result = await engine.send_message(user_input)
             last_tier = result.get("tier", "?")
             print(f"\nBot [{last_tier}]: {result['reply']}\n")
         except Exception as ex:
